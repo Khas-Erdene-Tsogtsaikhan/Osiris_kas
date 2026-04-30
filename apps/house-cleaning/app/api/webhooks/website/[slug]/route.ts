@@ -340,8 +340,12 @@ export async function POST(
   // immediately. Mirrors the [BOOKING_COMPLETE] branch in the openphone
   // webhook (apps/house-cleaning/app/api/webhooks/openphone/route.ts).
   const isWindowCleaningTenant = tenantUsesFeature(tenant, 'use_hcp_mirror')
+  // Address is optional here — the spotlessscrubbers.org quote calculator only
+  // collects name/phone/email + bed/bath. The customer fills in the address on
+  // the quote page itself (quotes.customer_address is nullable, and the quote
+  // UI prompts for address when it's missing).
   const hasQuoteableInfo =
-    !!(email && address && typeof bedrooms === 'number' && typeof bathrooms === 'number') &&
+    !!(email && typeof bedrooms === 'number' && typeof bathrooms === 'number') &&
     !!customer?.id &&
     !!lead?.id
 
@@ -365,7 +369,7 @@ export async function POST(
         customer_name: [firstName, lastName].filter(Boolean).join(' ') || null,
         customer_phone: phone,
         customer_email: email,
-        customer_address: address,
+        customer_address: address || null,
         bedrooms,
         bathrooms,
         square_footage: null,
