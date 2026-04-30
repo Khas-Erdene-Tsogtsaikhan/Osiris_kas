@@ -10,6 +10,7 @@ import { buildFirstTouchSMS } from "@/lib/website-lead-sms"
 import { transitionState } from "@/lib/lifecycle-state"
 import { computeNudgeSendTime } from "@/lib/nudge-timing"
 import { scheduleTask, scheduleRetargetingSequence } from "@/lib/scheduler"
+import { wireFollowupsAfterOutbound } from "@/lib/services/followups/wire"
 
 // CORS headers for embed-friendly response (any domain can POST)
 const corsHeaders = {
@@ -465,6 +466,23 @@ export async function POST(
           console.error('[Website Webhook] retargeting schedule failed (non-blocking):', retargetErr)
         }
 
+        // v2 ghost-chase wiring (Build 3, 2026-04-30). Idempotent + v2-flag-gated;
+        // safe even with the legacy quote_followup_urgent + scheduleRetargetingSequence
+        // calls above — the v2 cutover gate in process-scheduled-tasks cancels the
+        // legacy rows for tenants with followup_rebuild_v2_enabled=true.
+        try {
+          await wireFollowupsAfterOutbound({
+            tenant: { id: tenant.id, slug: tenant.slug, workflow_config: tenant.workflow_config },
+            customer: { id: customer.id, phone_number: phone },
+            quoteJustSent: true,
+            quoteId: newQuote.id,
+            activeLeadId: lead.id,
+            source: 'website_lead_quote',
+          })
+        } catch (wireErr) {
+          console.error('[Website Webhook] v2 wire (quote) failed (non-blocking):', wireErr)
+        }
+
         await client
           .from('quotes')
           .update({ followup_enrolled_at: new Date().toISOString() })
@@ -535,6 +553,24 @@ export async function POST(
       })
     } catch (stateErr) {
       console.error('[Website Webhook] transitionState failed (non-blocking):', stateErr)
+    }
+
+    // v2 ghost-chase wiring (Build 3, 2026-04-30) — root cause of La Monica
+    // 2026-04-30 incident: website-form leads bypassed the OpenPhone webhook
+    // path where the wire was integrated, so no ghost chase was scheduled.
+    // Idempotent + v2-flag-gated: noops on tenants without v2 enabled.
+    if (lead?.id) {
+      try {
+        await wireFollowupsAfterOutbound({
+          tenant: { id: tenant.id, slug: tenant.slug, workflow_config: tenant.workflow_config },
+          customer: { id: customer.id, phone_number: phone },
+          quoteJustSent: false,
+          activeLeadId: lead.id,
+          source: 'website_lead_auto',
+        })
+      } catch (wireErr) {
+        console.error('[Website Webhook] v2 wire (intro) failed (non-blocking):', wireErr)
+      }
     }
 
     // Schedule +2h overnight-catchup nudge (next-morning 9 AM tenant-local

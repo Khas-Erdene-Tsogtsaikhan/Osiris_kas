@@ -3,11 +3,13 @@ import { getSupabaseServiceClient } from "@/lib/supabase"
 import { normalizePhoneNumber } from "@/lib/phone-utils"
 import { scheduleLeadFollowUp } from "@/lib/scheduler"
 import { logSystemEvent } from "@/lib/system-events"
-import { getTenantBySlug, type Tenant } from "@/lib/tenant"
+import { getTenantBySlug, getTenantServiceDescription, type Tenant } from "@/lib/tenant"
 import { upsertLeadCustomer } from "@/lib/customer-dedup"
 import { sendSMS } from "@/lib/openphone"
 import { generateAutoResponse } from "@/lib/auto-response"
 import { analyzeBookingIntent } from "@/lib/ai-intent"
+import { buildFirstTouchSMS } from "@/lib/website-lead-sms"
+import { wireFollowupsAfterOutbound } from "@/lib/services/followups/wire"
 
 /**
  * Meta Webhook Router — handles ALL Page events for a tenant.
@@ -290,9 +292,58 @@ async function processMetaLead(
     },
   })
 
+  // ── First-touch SMS (Build 3 — Meta leads previously relied on legacy
+  // lead_followup stage 1 to send the intro, but the v2 cutover gate cancels
+  // that, so 3 Meta leads on 4/30 (Charles, Cory, Thomas) got zero SMS).
+  // Send directly + wire ghost chase, mirroring the website webhook pattern.
+  if (lead?.id && customer?.id) {
+    const businessName = (tenant as Tenant & { business_name_short?: string }).business_name_short || tenant.name || "Our team"
+    const sdrName = (tenant as Tenant & { sdr_persona?: string }).sdr_persona || "Mary"
+    const friendlyService = serviceType
+      ? serviceType.replace(/[-_]/g, " ")
+      : getTenantServiceDescription(tenant)
+
+    const smsBody = buildFirstTouchSMS({
+      firstName: firstName || "there",
+      sdrName,
+      businessName,
+      serviceType,
+      friendlyService,
+      bedrooms: null,
+      bathrooms: null,
+      address,
+      estimatedPrice: null,
+      promo: null,
+    })
+
+    const smsResult = await sendSMS(tenant, phone, smsBody, {
+      skipDedup: true,
+      source: "meta_lead_auto",
+      customerId: customer.id,
+    })
+
+    if (!smsResult.success) {
+      console.error(`[Meta Webhook] First-touch SMS failed for lead ${lead.id}:`, smsResult.error)
+    } else {
+      try {
+        await wireFollowupsAfterOutbound({
+          tenant: { id: tenant.id, slug: tenant.slug, workflow_config: tenant.workflow_config },
+          customer: { id: customer.id, phone_number: phone },
+          quoteJustSent: false,
+          activeLeadId: lead.id,
+          source: "meta_lead_auto",
+        })
+      } catch (wireErr) {
+        console.error("[Meta Webhook] v2 wire (intro) failed (non-blocking):", wireErr)
+      }
+    }
+  }
+
   if (lead?.id) {
     try {
       const leadName = `${firstName || ""} ${lastName || ""}`.trim() || "Customer"
+      // Legacy backup. Stage 1 dedup'd by message-source check; stages 2-5 are
+      // cancelled by v2 cutover gate when followup_rebuild_v2_enabled=true.
       await scheduleLeadFollowUp(tenant.id, String(lead.id), phone, leadName)
       console.log(`[Meta Webhook] Scheduled follow-up for Meta lead ${lead.id} (${tenant.slug})`)
     } catch (err) {

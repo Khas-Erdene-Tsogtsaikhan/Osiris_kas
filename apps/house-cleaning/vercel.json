@@ -5,6 +5,10 @@
       "schedule": "* * * * *"
     },
     {
+      "path": "/api/cron/wire-check-net",
+      "schedule": "*/5 * * * *"
+    },
+    {
       "path": "/api/cron/ghl-followups",
       "schedule": "*/2 * * * *"
     },
