@@ -349,6 +349,12 @@ export async function POST(
     !!customer?.id &&
     !!lead?.id
 
+  // Hold onto the quote URL across silent fall-through paths in the upfront-
+  // quote branch (quote insert errors, quote-SMS errors). Even when the
+  // dedicated quote SMS fails, we still want to surface the URL in the
+  // buildFirstTouchSMS fallback so the customer always gets a usable link.
+  let pendingQuoteUrl: string | null = null
+
   if (hasQuoteableInfo && !isWindowCleaningTenant) {
     const svcType = (serviceType || '').toLowerCase()
     const quoteCategory = svcType.includes('move') ? 'move_in_out' : 'standard'
@@ -390,6 +396,27 @@ export async function POST(
 
     if (quoteError || !newQuote) {
       console.error('[Website Webhook] Upfront quote insert failed; falling through to first-touch ack:', quoteError)
+      await logSystemEvent({
+        tenant_id: tenant.id,
+        source: 'website',
+        event_type: 'WEBSITE_UPFRONT_QUOTE_INSERT_FAIL',
+        message: `Upfront quote insert failed for ${tenant.slug}: ${quoteError?.code || 'no-row'} ${quoteError?.message || ''}`.trim(),
+        phone_number: phone,
+        metadata: {
+          lead_id: lead.id,
+          customer_id: customer.id,
+          code: quoteError?.code,
+          message: quoteError?.message,
+          details: quoteError?.details,
+          hint: quoteError?.hint,
+          service_category: quoteCategory,
+          selected_tier: promoConfig?.tier || formTier,
+          bedrooms,
+          bathrooms,
+          has_address: !!address,
+          has_email: !!email,
+        },
+      })
     } else {
       await client
         .from('customers')
@@ -400,6 +427,9 @@ export async function POST(
       const { getClientConfig } = await import('@/lib/client-config')
       const appDomain = getClientConfig().domain.replace(/\/+$/, '')
       const quoteUrl = `${appDomain}/quote/${newQuote.token}`
+      // Capture the URL up-front so it survives the quote-SMS failure path
+      // and gets appended to the buildFirstTouchSMS fallback below.
+      pendingQuoteUrl = quoteUrl
 
       let quoteMsg: string
       if (isMetaPromo && promoConfig) {
@@ -422,7 +452,20 @@ export async function POST(
 
       if (!quoteSmsResult.success) {
         console.error('[Website Webhook] Upfront quote SMS failed:', quoteSmsResult.error)
-        // fall through — first-touch ack below will still send
+        await logSystemEvent({
+          tenant_id: tenant.id,
+          source: 'website',
+          event_type: 'WEBSITE_UPFRONT_QUOTE_SMS_FAIL',
+          message: `Upfront quote SMS failed for ${phone}: ${quoteSmsResult.error || 'unknown'}`,
+          phone_number: phone,
+          metadata: {
+            lead_id: lead.id,
+            quote_id: newQuote.id,
+            quote_url: quoteUrl,
+            error: quoteSmsResult.error,
+          },
+        })
+        // fall through — first-touch fallback below will append the quote URL
       } else {
         await client
           .from('leads')
@@ -520,7 +563,7 @@ export async function POST(
     }
   }
 
-  const smsMessage = buildFirstTouchSMS({
+  const baseSmsMessage = buildFirstTouchSMS({
     firstName,
     sdrName,
     businessName,
@@ -532,6 +575,13 @@ export async function POST(
     estimatedPrice,
     promo: promoConfig ? { price: promoConfig.price, firstSms: promoConfig.firstSms } : null,
   })
+
+  // If we managed to create a quote upstream but the dedicated quote SMS
+  // didn't go through, append the URL to the first-touch ack so the customer
+  // still gets a clickable link instead of just "what's the address?".
+  const smsMessage = pendingQuoteUrl
+    ? `${baseSmsMessage} Or grab pricing here: ${pendingQuoteUrl}`
+    : baseSmsMessage
 
   // sendSMS pre-inserts its own messages row (via the `source` option) and
   // cleans it up on failure, so no manual insert is needed here.
@@ -638,7 +688,7 @@ export async function POST(
   }
 
   return NextResponse.json(
-    { success: true, id: lead?.id },
+    { success: true, id: lead?.id, ...(pendingQuoteUrl ? { quote_url: pendingQuoteUrl } : {}) },
     { headers: corsHeaders }
   )
 }
