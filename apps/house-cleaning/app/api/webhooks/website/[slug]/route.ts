@@ -11,6 +11,7 @@ import { transitionState } from "@/lib/lifecycle-state"
 import { computeNudgeSendTime } from "@/lib/nudge-timing"
 import { scheduleTask, scheduleRetargetingSequence } from "@/lib/scheduler"
 import { wireFollowupsAfterOutbound } from "@/lib/services/followups/wire"
+import { inferLeadSourceFromUtm } from "@/lib/lead-sources"
 
 // CORS headers for embed-friendly response (any domain can POST)
 const corsHeaders = {
@@ -118,7 +119,18 @@ export async function POST(
   const serviceType = (body.service_type as string) || (body.serviceType as string) || ""
   const message = (body.message as string) || (body.notes as string) || ""
   const sourceDetail = (body.source as string) || "website"
-  const source = "website" // DB CHECK constraint — detail preserved in form_data
+  // Marketing-attribution: a customer who clicked an LSA / Google Ad / Meta ad and landed
+  // on the website should be tagged accordingly, not just as "website". Falls back to website
+  // when no utm_* hints match. Detail still preserved in form_data below.
+  const attribution = inferLeadSourceFromUtm({
+    utm_source: body.utm_source as string | undefined,
+    utm_medium: body.utm_medium as string | undefined,
+    utm_campaign: body.utm_campaign as string | undefined,
+    utm_content: body.utm_content as string | undefined,
+    utm_term: body.utm_term as string | undefined,
+  })
+  const source = attribution?.dbEnum ?? "website"
+  const leadSourceDisplay = attribution?.display ?? "Website"
   const bedrooms = typeof body.bedrooms === "number" ? body.bedrooms : null
   const bathrooms = typeof body.bathrooms === "number" ? body.bathrooms : null
   const frequency = (body.frequency as string) || null
@@ -138,7 +150,7 @@ export async function POST(
     last_name: lastName || null,
     email: email || null,
     address: address || null,
-    lead_source: source,
+    lead_source: leadSourceDisplay,
   })
   const customer = dedupResult ? { id: dedupResult.customer_id } : null
 
@@ -212,6 +224,7 @@ export async function POST(
       form_data: {
         ...body,
         source_detail: sourceDetail,
+        attribution_source: leadSourceDisplay,
         service_type: serviceType,
         message,
         address,

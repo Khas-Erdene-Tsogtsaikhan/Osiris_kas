@@ -424,11 +424,13 @@ export default function LeadsPage() {
                 <SelectItem value="phone">Phone Call</SelectItem>
                 <SelectItem value="meta">Meta Ads</SelectItem>
                 <SelectItem value="google_lsa">Google LSA</SelectItem>
+                <SelectItem value="google">Google Ads</SelectItem>
                 <SelectItem value="website">Website</SelectItem>
                 <SelectItem value="sms">SMS</SelectItem>
                 <SelectItem value="sam">SAM</SelectItem>
                 <SelectItem value="ghl">GoHighLevel</SelectItem>
                 <SelectItem value="thumbtack">Thumbtack</SelectItem>
+                <SelectItem value="angi">Angi</SelectItem>
               </SelectContent>
             </Select>
             <Select value={statusFilter} onValueChange={setStatusFilter}>

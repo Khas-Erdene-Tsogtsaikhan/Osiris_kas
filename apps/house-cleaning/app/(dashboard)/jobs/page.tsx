@@ -14,6 +14,7 @@ import { formatDate } from "@fullcalendar/core"
 import type { DateSelectArg, EventClickArg, EventDropArg, EventInput } from "@fullcalendar/core"
 import { WINBROS_CALENDAR_ADDONS, WINDOW_TIERS, type WindowTier } from "@/lib/pricebook"
 import { TIER_UPGRADES, isIncludedInTier, getPaidAddons, isEffectivelyIncluded } from "@/lib/service-scope"
+import { KNOWN_LEAD_SOURCES } from "@/lib/lead-sources"
 import { suggestCleanerPay, type CleanerPayConfig } from "@/lib/suggest-cleaner-pay"
 import ScheduleGantt, { type GanttJob } from "@/components/dashboard/schedule-gantt"
 import { DollarSign, CreditCard, FileText, KeyRound, Zap, Copy, Check, Send, Loader2 } from "lucide-react"
@@ -4247,7 +4248,7 @@ export default function JobsPage() {
                 <div style={{ marginBottom: "0.5rem" }}>
                   <label className="cal-form-label">Lead Source <span style={{ color: "#ef4444" }}>*</span></label>
                   {(() => {
-                    const knownSources = ["Website", "Google", "Referral", "Facebook", "Instagram", "Nextdoor", "Yelp", "Thumbtack", "Angi", "Door Hanger", "Yard Sign", "Repeat Customer"]
+                    const knownSources = KNOWN_LEAD_SOURCES as readonly string[]
                     const isKnown = knownSources.includes(createForm.lead_source) || createForm.lead_source === ""
 
                     return (
