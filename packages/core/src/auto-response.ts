@@ -1488,7 +1488,7 @@ export async function generateEmailResponse(
 
     const response = await client.messages.create({
       model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 800,
+      max_tokens: 1500,
       system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: userMessage }],
     })
@@ -1503,7 +1503,9 @@ export async function generateEmailResponse(
     const lastCustomerMsg = conversationHistory?.filter(m => m.role === 'client').pop()?.content
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
     const isBookingComplete = detectBookingComplete(rawText)
-    const cleanResponse = sanitizeAIResponse(autoSplitLongMessage(stripEscalationTags(rawText)))
+    // Email-only: no SMS chunking (||| splits) and no SMS sanitizer (it strips
+    // markdown bullets, em-dashes, and any sentence containing "email").
+    const cleanResponse = stripEscalationTags(rawText).trim()
 
     return {
       response: cleanResponse,
@@ -1522,7 +1524,7 @@ export async function generateEmailResponse(
 
     const response = await client.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 800,
+      max_tokens: 1500,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
@@ -1538,7 +1540,7 @@ export async function generateEmailResponse(
     const lastCustomerMsg = conversationHistory?.filter(m => m.role === 'client').pop()?.content
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
     const isBookingComplete = detectBookingComplete(rawText)
-    const cleanResponse = sanitizeAIResponse(autoSplitLongMessage(stripEscalationTags(rawText)))
+    const cleanResponse = stripEscalationTags(rawText).trim()
 
     return {
       response: cleanResponse,
