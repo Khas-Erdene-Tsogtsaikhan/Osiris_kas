@@ -410,7 +410,11 @@ function findPricingRow(
     t => t.service_type === serviceType && t.bedrooms === bedrooms && Number(t.bathrooms) === roundedBathrooms
   )
   if (exact) {
-    return { price: Number(exact.price), labor_hours: Number(exact.labor_hours), cleaners: exact.cleaners }
+    // Round to whole dollars so the quote page matches what the voice/SMS
+    // surfaces speak ($Intl with maximumFractionDigits:0). Without this, a
+    // pricing_tiers row of 362.50 surfaces as "$363" on the call but
+    // "$362.50" on the quote page — the customer notices.
+    return { price: Math.round(Number(exact.price)), labor_hours: Number(exact.labor_hours), cleaners: exact.cleaners }
   }
 
   // Find closest match (same service type, closest bed/bath)
@@ -425,7 +429,7 @@ function findPricingRow(
   })
 
   const best = sorted[0]
-  return { price: Number(best.price), labor_hours: Number(best.labor_hours), cleaners: best.cleaners }
+  return { price: Math.round(Number(best.price)), labor_hours: Number(best.labor_hours), cleaners: best.cleaners }
 }
 
 /** Tenant-specific scope-of-work lines shown in the tier card breakdown. */
