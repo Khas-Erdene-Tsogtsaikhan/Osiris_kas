@@ -123,6 +123,28 @@ export function resolveStripeChargeCents(
   return { amountCents: testChargeCents, testChargeCents }
 }
 
+// Strip control chars / zero-width unicode and normalize. Stripe's customers.create
+// rejects emails with hidden whitespace ("Invalid email address") even though
+// customers.list happily searches with them — that mismatch is what produced the
+// "lookup failed → create failed" error chain on a visually-valid address.
+function sanitizeEmailForStripe(email?: string | null): string | undefined {
+  if (!email) return undefined
+  const cleaned = Array.from(String(email))
+    .filter((char) => {
+      const code = char.charCodeAt(0)
+      if (code <= 0x20) return false
+      if (code === 0x7f) return false
+      if (code >= 0x80 && code <= 0x9f) return false
+      if (code === 0x200b || code === 0x200c || code === 0x200d || code === 0xfeff) return false
+      return true
+    })
+    .join('')
+    .toLowerCase()
+  if (!cleaned) return undefined
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleaned)) return undefined
+  return cleaned
+}
+
 /**
  * Create a Stripe customer
  * stripeSecretKey is REQUIRED — must be the tenant's own Stripe key.
@@ -137,8 +159,12 @@ export async function createStripeCustomer(
 
     const normalizedPhone = toE164(customer.phone_number)
     const resolvedCountry = country || inferCountryFromAddress(customer.address) || 'US'
+    const cleanEmail = sanitizeEmailForStripe(customer.email)
+    if (customer.email && !cleanEmail) {
+      console.warn(`[Stripe] Dropping malformed email on customer create: ${JSON.stringify(customer.email)}`)
+    }
     const stripeCustomer = await stripe.customers.create({
-      email: customer.email,
+      email: cleanEmail,
       phone: normalizedPhone || undefined,
       name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim() || undefined,
       address: customer.address
@@ -174,12 +200,18 @@ export async function findOrCreateStripeCustomer(
     throw new Error('Cannot create Stripe customer without email')
   }
 
+  const cleanEmail = sanitizeEmailForStripe(customer.email)
+  if (!cleanEmail) {
+    console.warn(`[Stripe] findOrCreateStripeCustomer: email failed sanitization, creating without email. Raw: ${JSON.stringify(customer.email)}`)
+    return await createStripeCustomer({ ...customer, email: undefined }, stripeSecretKey)
+  }
+
   try {
     const stripe = getStripeClientForTenant(stripeSecretKey)
 
     // Search for existing customer by email
     const existingCustomers = await stripe.customers.list({
-      email: customer.email,
+      email: cleanEmail,
       limit: 1,
     })
 
@@ -188,8 +220,8 @@ export async function findOrCreateStripeCustomer(
       return existingCustomers.data[0]
     }
 
-    // Create new customer
-    return await createStripeCustomer(customer, stripeSecretKey)
+    // Create new customer (with sanitized email)
+    return await createStripeCustomer({ ...customer, email: cleanEmail }, stripeSecretKey)
   } catch (error) {
     console.error('Error finding/creating Stripe customer:', error)
     const message = error instanceof Error ? error.message : 'Unknown error'
