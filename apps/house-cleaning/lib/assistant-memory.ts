@@ -158,9 +158,11 @@ export async function extractAndStoreFacts(
       .join("\n")
 
     const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20250929",
+      model: "claude-haiku-4-5-20251001",
       max_tokens: 500,
-      system: `You are a fact extraction engine for a business assistant. Extract key facts from this conversation between a business owner and their AI assistant.
+      system: [{
+        type: "text" as const,
+        text: `You are a fact extraction engine for a business assistant. Extract key facts from this conversation between a business owner and their AI assistant.
 
 Return ONLY a JSON array of objects, each with:
 - "category": one of "user_preference", "business_pattern", "customer_note", "workflow_preference", "general"
@@ -175,6 +177,8 @@ Only extract genuinely useful, durable facts that would help the assistant in fu
 
 If no meaningful facts can be extracted, return [].
 Do NOT extract trivial greetings or one-off questions.`,
+        cache_control: { type: "ephemeral" as const },
+      }],
       messages: [{ role: "user", content: transcript }],
     })
 
@@ -291,7 +295,7 @@ export async function summarizeConversation(
     const transcript = messages.map((m) => `${m.role}: ${m.content}`).join("\n")
 
     const response = await anthropic.messages.create({
-      model: "claude-haiku-4-5-20250929",
+      model: "claude-haiku-4-5-20251001",
       max_tokens: 300,
       system: `Summarize this business assistant conversation in 2-3 sentences. Focus on: what was discussed, what actions were taken, and any decisions made.
 

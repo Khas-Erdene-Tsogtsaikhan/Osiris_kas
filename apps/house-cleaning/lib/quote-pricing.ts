@@ -634,6 +634,20 @@ export async function computeQuoteTotal(
     }
   }
 
+  // ── T7 sanity assertion (2026-04-20, Linda Kingcade / Texas Nova) ─────
+  // If the subtotal exceeds 2.5× the tier base price, something is probably
+  // misconfigured: addons over-seeded, TIER_UPGRADES missing a key, or custom
+  // addons double-counting. Log a warning so ops can audit the seed. We don't
+  // block the quote (the pricing engine must remain authoritative), but we
+  // surface the signal so Dominic can catch it before it ships to a customer.
+  if (tierPrice.price > 0 && subtotal > tierPrice.price * 2.5) {
+    console.warn(
+      `[quote-pricing] SANITY: tenant=${tenantSlug} tier=${selectedTier} base=$${tierPrice.price} subtotal=$${subtotal} ` +
+      `(ratio ${(subtotal / tierPrice.price).toFixed(2)}x). Likely a pricing_addons over-seed or missing TIER_UPGRADES entry. ` +
+      `Selected addons: ${selectedAddons.map(a => typeof a === 'string' ? a : a.key).join(',')}`
+    )
+  }
+
   return {
     subtotal,
     breakdown: [

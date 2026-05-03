@@ -3,7 +3,7 @@
 // Analyzes real business outcomes, generates operational insights,
 // and discovers new knowledge sources automatically.
 
-import { getSupabaseServiceClient } from '@/lib/supabase'
+import { getSupabaseServiceClient } from '../supabase'
 
 // ── Learn from Operational Data ─────────────────────────────────────
 

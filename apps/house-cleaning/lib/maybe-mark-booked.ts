@@ -2,7 +2,7 @@
  * maybeMarkBooked — centralized "booked" gate.
  *
  * A job is only "booked" when BOTH conditions are true:
- *   1. Payment received  (payment_status = deposit_paid | fully_paid | card_on_file, OR paid = true)
+ *   1. Payment received  (payment_status = deposit_paid | fully_paid, OR paid = true)
  *   2. Cleaner assigned  (at least one cleaner_assignment in pending/accepted/confirmed)
  *
  * Call this after any payment confirmation or cleaner assignment.
@@ -31,7 +31,6 @@ export async function maybeMarkBooked(
   const hasPaid =
     job.payment_status === 'deposit_paid' ||
     job.payment_status === 'fully_paid' ||
-    job.payment_status === 'card_on_file' ||
     job.paid === true
 
   if (!hasPaid) return false

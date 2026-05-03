@@ -64,6 +64,14 @@ export const TENANT_TIER_ADDITIONS: Record<string, Record<string, string[]>> = {
     standard: ['interior_windows'],
     deep: ['interior_windows'],
   },
+  // Texas Nova (Patrick) — deep and move tiers include the standard HC
+  // platform extras. Without this, baseboards/ceiling_fans/etc get
+  // re-charged on top of the deep-tier base (root cause of Linda
+  // Kingcade's $562 inflated quote; T7 fix 2026-04-20).
+  'texas-nova': {
+    deep: ['baseboards', 'ceiling_fans', 'light_fixtures', 'window_sills', 'inside_microwave'],
+    move: ['baseboards', 'ceiling_fans', 'light_fixtures', 'window_sills', 'inside_microwave'],
+  },
 }
 
 function getTenantAdditions(tier: string, tenantSlug?: string): string[] {

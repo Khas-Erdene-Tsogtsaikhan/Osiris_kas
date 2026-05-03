@@ -1,7 +1,7 @@
 // Stub — full implementation lives in apps/window-washing/lib/winbros-sms-prompt.ts.
 // The tag-detection helpers below are generic across tenants and are exported here
-// because auto-response.ts imports them via the sibling './winbros-sms-prompt' path,
-// which always resolves to this file (not the per-app override).
+// because packages/core/src/auto-response.ts imports them via the sibling './winbros-sms-prompt'
+// path, which always resolves to this file (not the per-app override).
 export function buildWinBrosJobNotes(..._args: unknown[]) { return '' }
 export function parseNaturalDate(..._args: unknown[]) { return null }
 

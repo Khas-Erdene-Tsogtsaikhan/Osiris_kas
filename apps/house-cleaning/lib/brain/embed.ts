@@ -2,7 +2,7 @@
 // Embedding generation for Brain knowledge chunks.
 // Uses OpenAI text-embedding-3-small (same as conversation-scoring.ts).
 
-import { getSupabaseServiceClient } from '@/lib/supabase'
+import { getSupabaseServiceClient } from '../supabase'
 
 const EMBEDDING_MODEL = 'text-embedding-3-small'
 const BATCH_SIZE = 20

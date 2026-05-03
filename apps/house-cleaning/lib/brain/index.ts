@@ -3,7 +3,7 @@
 // Retrieves relevant knowledge chunks via vector similarity,
 // combines with business context, and uses Claude to reason.
 
-import { getSupabaseServiceClient } from '@/lib/supabase'
+import { getSupabaseServiceClient } from '../supabase'
 import { generateEmbedding } from './embed'
 import type { BrainQueryOptions, BrainAnswer, MatchedChunk } from './types'
 
@@ -124,9 +124,9 @@ async function reasonWithClaude(
     const client = new Anthropic({ apiKey: anthropicKey })
 
     const response = await client.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1500,
-      system: `You are the Osiris Brain — an expert autonomous AI that runs cleaning businesses.
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1000,
+      system: [{ type: 'text', text: `You are the Osiris Brain — an expert autonomous AI that runs cleaning businesses.
 You have deep knowledge of the cleaning industry from top coaches and operators.
 You make decisions that maximize profit, customer satisfaction, and operational efficiency.
 
@@ -140,7 +140,7 @@ ALWAYS return a JSON object with exactly these fields:
   "confidence": 0.0-1.0 (how confident you are based on the available knowledge)
 }
 
-If the knowledge base doesn't cover the question well, say so honestly and give your best answer with lower confidence.`,
+If the knowledge base doesn't cover the question well, say so honestly and give your best answer with lower confidence.`, cache_control: { type: 'ephemeral' } }],
       messages: [{
         role: 'user',
         content: `KNOWLEDGE BASE:\n${knowledgeContext}\n${businessContext}\n\nQUESTION: ${question}`,

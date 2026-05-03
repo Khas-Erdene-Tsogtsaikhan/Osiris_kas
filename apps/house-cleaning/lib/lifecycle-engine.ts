@@ -28,24 +28,6 @@ export async function canSendToCustomer(
 
   const client = getSupabaseServiceClient()
 
-  // Check auto_response_disabled and sms_opt_out FIRST — these are hard blocks
-  try {
-    const { data: customer } = await client
-      .from('customers')
-      .select('auto_response_disabled, sms_opt_out')
-      .eq('id', customerId)
-      .maybeSingle()
-
-    if (customer?.auto_response_disabled || customer?.sms_opt_out) {
-      console.log(`[lifecycle-engine] SMS blocked for customer ${customerId} — disabled or opted out`)
-      return false
-    }
-  } catch {
-    // fail closed — if we can't check, block the send
-    console.error(`[lifecycle-engine] Failed to check auto_response_disabled for customer ${customerId} — blocking`)
-    return false
-  }
-
   // Phase-specific cooldown (tenant-scoped)
   const cooldownCutoff = new Date(Date.now() - cooldownHours * 60 * 60 * 1000).toISOString()
   let phaseQuery = client

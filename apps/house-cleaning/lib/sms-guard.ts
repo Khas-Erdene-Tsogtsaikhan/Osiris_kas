@@ -125,6 +125,37 @@ async function checkPriceAccuracy(
   }
 }
 
+// ── Booking Confirmation Guard ──────────────────────────────────────
+//
+// Blocks phrases that claim a booking is locked in when no confirmed job row
+// exists. Prevents hallucinated confirmations (Rosemary Johnson incident,
+// 2026-04-20) which cause no-shows, chargebacks, and reputation damage.
+//
+// A "confirmed booking" = a `jobs` row with status IN ('scheduled','in_progress').
+// A 'quoted' job is NOT a confirmation.
+
+const BOOKING_CONFIRMATION_PATTERNS: RegExp[] = [
+  /\byou.?re\s+(all\s+set|booked|confirmed|scheduled)\b/i,
+  /\bwe.?ve\s+got\s+you\s+(booked|confirmed|scheduled|set)\b/i,
+  /\bconfirmed\s+for\s+\w+day\b/i,
+  /\bscheduled\s+for\s+\w+day\b/i,
+  /\byour\s+(cleaning|booking|appointment|service)\s+is\s+(confirmed|scheduled|booked|locked\s+in|set)\b/i,
+  /\blocked\s+in\s+(?:for|your)\b/i,
+  /\bI.?ve\s+(booked|scheduled|confirmed)\s+(?:you|your)\b/i,
+  /\bgot\s+you\s+on\s+the\s+(?:calendar|schedule)\b/i,
+  /\bbooking\s+confirmed\b/i,
+  /\bsee\s+you\s+(?:on\s+)?\w+day\b/i, // e.g. "see you Monday"
+]
+
+function checkBookingConfirmationLanguage(message: string): { found: boolean; matches: string[] } {
+  const matches: string[] = []
+  for (const pattern of BOOKING_CONFIRMATION_PATTERNS) {
+    const match = message.match(pattern)
+    if (match) matches.push(match[0])
+  }
+  return { found: matches.length > 0, matches }
+}
+
 // ── Conversation Stage Detection ────────────────────────────────────
 
 export function detectConversationStage(
@@ -236,6 +267,12 @@ export async function guardMessage(
     bedrooms?: number | null
     bathrooms?: number | null
     hasActiveJob?: boolean
+    /**
+     * True only when a `jobs` row exists with status IN ('scheduled','in_progress').
+     * A 'quoted' job does NOT count — quoted is not confirmed. Required for the
+     * booking-confirmation guard to allow confirmation language through.
+     */
+    hasConfirmedBooking?: boolean
     hasPriceBeenQuoted?: boolean
   }
 ): Promise<GuardResult> {
@@ -258,6 +295,22 @@ export async function guardMessage(
       warnings: [`BLOCKED: Discount language detected — ${discountCheck.matches.join(', ')}`],
       shouldEscalate: true,
       escalationReason: 'AI attempted to offer unauthorized discount — escalating to owner',
+      conversationStage: stage,
+    }
+  }
+
+  // 2.5. Check for hallucinated booking confirmation (HARD BLOCK)
+  // If the AI emits "you're all set / confirmed / booked / scheduled for X"
+  // without a real confirmed booking in the DB, block it and escalate.
+  const confirmationCheck = checkBookingConfirmationLanguage(aiResponse)
+  if (confirmationCheck.found && !customerInfo?.hasConfirmedBooking) {
+    return {
+      safe: false,
+      blocked: true,
+      reason: `AI emitted booking-confirmation language without a confirmed booking: "${confirmationCheck.matches.join('", "')}"`,
+      warnings: [`BLOCKED: Hallucinated confirmation — ${confirmationCheck.matches.join(', ')}`],
+      shouldEscalate: true,
+      escalationReason: 'AI claimed booking is confirmed when no confirmed `jobs` row exists — risks no-shows and chargebacks',
       conversationStage: stage,
     }
   }

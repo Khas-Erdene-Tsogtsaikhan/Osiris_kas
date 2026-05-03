@@ -8,7 +8,6 @@ import OpenAI from 'openai'
 import type { IntentAnalysis } from './ai-intent'
 import type { Tenant } from './tenant'
 import { getTenantServiceDescription, getTenantBusinessContext, tenantUsesFeature, formatTenantCurrency } from './tenant'
-import { getPromoConfig, CAMPAIGN_CONTEXTS } from './promo-config'
 
 // =====================================================================
 // POST-PROCESSING: Sanitize AI output before sending as SMS
@@ -16,11 +15,8 @@ import { getPromoConfig, CAMPAIGN_CONTEXTS } from './promo-config'
 
 function sanitizeAIResponse(text: string): string {
   let cleaned = text
-  // Strip ALL emoji characters
   cleaned = cleaned.replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{200D}\u{1F900}-\u{1F9FF}\u{1FA00}-\u{1FA6F}\u{1FA70}-\u{1FAFF}\u{231A}-\u{231B}\u{23E9}-\u{23F3}\u{23F8}-\u{23FA}\u{25AA}-\u{25AB}\u{25B6}\u{25C0}\u{25FB}-\u{25FE}\u{2934}-\u{2935}\u{2B05}-\u{2B07}\u{2B1B}-\u{2B1C}\u{2B50}\u{2B55}\u{3030}\u{303D}\u{3297}\u{3299}]/gu, '')
-  // Replace em/en dashes
   cleaned = cleaned.replace(/\u2014/g, ',').replace(/\u2013/g, '-')
-  // Strip markdown
   cleaned = cleaned.replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1')
     .replace(/^#{1,6}\s+/gm, '').replace(/^[-*+]\s+/gm, '')
   // Strip any sentence containing "email" (model keeps asking despite instructions)
@@ -62,6 +58,114 @@ export interface AutoResponseResult {
     reasons: string[]
   }
   bookingComplete?: boolean
+  /**
+   * True when this response is the pre-quote rapport / value-build turn that
+   * fires once per lead lifecycle BEFORE the quote link is sent. The webhook
+   * caller is responsible for stamping `customers.pre_quote_rapport_sent_at`
+   * when this is true.
+   *
+   * Plan: ~/.claude/plans/a-remeber-i-said-drifting-manatee.md (Build 1 #2)
+   */
+  rapportSent?: boolean
+}
+
+/**
+ * Strip dollar / currency tokens from an SMS body. Defense-in-depth against
+ * the AI leaking a price into the SMS — price MUST live only on the quote
+ * page, never in plain text. Runs when a [BOOKING_COMPLETE] tag is present
+ * (i.e. the system is about to send the quote link separately, so any number
+ * the AI wrote is redundant and harmful).
+ *
+ * Exported for unit testing.
+ *
+ * Plan: ~/.claude/plans/a-remeber-i-said-drifting-manatee.md (Build 1 #1)
+ */
+export function stripCurrencyForQuoteSend(text: string): { stripped: string; didStrip: boolean } {
+  let cleaned = text
+  let didStrip = false
+
+  // $123, $123.45, $1,234.56
+  const dollarRe = /\$\s*\d{1,3}(?:[,\d]{0,8})?(?:\.\d{1,2})?/g
+  if (dollarRe.test(cleaned)) {
+    didStrip = true
+    cleaned = cleaned.replace(dollarRe, 'your price')
+  }
+
+  // 123 USD, 123 CAD, 123 dollars
+  const currencyWordRe = /\b\d{1,4}(?:[,\d]{0,8})?(?:\.\d{1,2})?\s*(?:USD|CAD|dollars|bucks)\b/gi
+  if (currencyWordRe.test(cleaned)) {
+    didStrip = true
+    cleaned = cleaned.replace(currencyWordRe, 'your price')
+  }
+
+  // CA$123, US$123
+  const prefixedSymbolRe = /\b(?:CA|US)\$\s*\d{1,4}(?:[,\d]{0,8})?(?:\.\d{1,2})?/gi
+  if (prefixedSymbolRe.test(cleaned)) {
+    didStrip = true
+    cleaned = cleaned.replace(prefixedSymbolRe, 'your price')
+  }
+
+  // Collapse repeated "your price" or "your price your price"
+  cleaned = cleaned.replace(/(?:your price\s*){2,}/g, 'your price ')
+  // Collapse extra whitespace
+  cleaned = cleaned.replace(/\s{2,}/g, ' ').trim()
+
+  return { stripped: cleaned, didStrip }
+}
+
+/**
+ * Pure helper: compute rapport-first gate + takeover-resume awareness from
+ * customer context + known facts. Extracted from `generateHouseCleaningResponse`
+ * so it can be unit-tested without mocking the AI clients.
+ *
+ * - `shouldDeliverRapportFirst` is true when the AI has all booking facts
+ *   (bed/bath + address) AND the customer has never received the pre-quote
+ *   rapport message AND they are not a retargeting reply / returning customer
+ *   / customer with an active job.
+ * - `humanTakeoverRecentlyEnded` is true when human_takeover_until expired
+ *   within the last 24h OR is about to expire within 5 minutes — both states
+ *   require the AI to read history carefully on resume.
+ *
+ * Plan: ~/.claude/plans/a-remeber-i-said-drifting-manatee.md (Build 1 #2 + #3)
+ */
+export interface RapportGateInput {
+  knownCustomerInfo?: KnownCustomerInfo
+  customerContext?: CustomerContext | null
+  isRetargetingReply?: boolean
+  /** Override Date.now() for deterministic tests */
+  nowMs?: number
+}
+export interface RapportGateResult {
+  shouldDeliverRapportFirst: boolean
+  humanTakeoverRecentlyEnded: boolean
+}
+export function computeRapportGate(input: RapportGateInput): RapportGateResult {
+  const { knownCustomerInfo, customerContext, isRetargetingReply } = input
+  const now = input.nowMs ?? Date.now()
+
+  const hasBedBath = !!(knownCustomerInfo?.bedrooms && knownCustomerInfo?.bathrooms)
+  const hasAddress = !!knownCustomerInfo?.address
+  const bookingFactsReady = hasBedBath && hasAddress
+
+  const rapportAlreadySent = !!customerContext?.customer?.pre_quote_rapport_sent_at
+  const suppressRapport = !!isRetargetingReply
+    || (customerContext?.activeJobs?.length ?? 0) > 0
+    || (customerContext?.totalJobs ?? 0) > 0
+
+  const shouldDeliverRapportFirst = bookingFactsReady && !rapportAlreadySent && !suppressRapport
+
+  const takeoverUntilStr = customerContext?.customer?.human_takeover_until
+  let humanTakeoverRecentlyEnded = false
+  if (takeoverUntilStr) {
+    const t = new Date(takeoverUntilStr).getTime()
+    if (!Number.isNaN(t)) {
+      const expiredRecently = t < now && now - t < 24 * 60 * 60 * 1000
+      const aboutToExpire = t > now && t - now < 5 * 60 * 1000
+      humanTakeoverRecentlyEnded = expiredRecently || aboutToExpire
+    }
+  }
+
+  return { shouldDeliverRapportFirst, humanTakeoverRecentlyEnded }
 }
 
 /**
@@ -120,6 +224,10 @@ export interface CustomerContext {
     address: string | null
     notes: string | null
     housecall_pro_customer_id: string | number | null
+    /** When AI sent the pre-quote rapport turn. NULL = not yet sent. (Build 1 #2) */
+    pre_quote_rapport_sent_at: string | null
+    /** Active human-operator hold; AI must NOT auto-respond while in the future. (Build 1 #3) */
+    human_takeover_until: string | null
   } | null
   // Lead record (if exists)
   lead: {
@@ -165,10 +273,10 @@ export async function loadCustomerContext(
       .order("completed_at", { ascending: false })
       .limit(3),
 
-    // Customer profile
+    // Customer profile (Build 1: also fetch rapport + takeover state for messaging-flow gating)
     customerId
-      ? client.from("customers").select("id, first_name, last_name, email, address, notes, housecall_pro_customer_id").eq("id", customerId).eq("tenant_id", tenantId).maybeSingle()
-      : client.from("customers").select("id, first_name, last_name, email, address, notes, housecall_pro_customer_id").eq("tenant_id", tenantId).eq("phone_number", phone).maybeSingle(),
+      ? client.from("customers").select("id, first_name, last_name, email, address, notes, housecall_pro_customer_id, pre_quote_rapport_sent_at, human_takeover_until").eq("id", customerId).eq("tenant_id", tenantId).maybeSingle()
+      : client.from("customers").select("id, first_name, last_name, email, address, notes, housecall_pro_customer_id, pre_quote_rapport_sent_at, human_takeover_until").eq("tenant_id", tenantId).eq("phone_number", phone).maybeSingle(),
 
     // Lead record
     client
@@ -253,7 +361,7 @@ export function formatCustomerContextForPrompt(ctx: CustomerContext, tenant: Ten
 
   // Active jobs
   if (ctx.activeJobs.length > 0) {
-    parts.push('ACTIVE BOOKINGS FOR THIS CUSTOMER:')
+    parts.push('== AUTHORITATIVE APPOINTMENT (source of truth — overrides anything said earlier in conversation) ==')
     for (const job of ctx.activeJobs) {
       const rawDate = job.date || job.scheduled_at || ''
       const datePart = rawDate ? formatDateForContext(rawDate, tenant.timezone || 'America/Chicago') : 'TBD'
@@ -262,10 +370,10 @@ export function formatCustomerContextForPrompt(ctx: CustomerContext, tenant: Ten
       parts.push(`  - ${(job.service_type || 'Cleaning').replace(/_/g, ' ')} on ${datePart} (${job.status})${pricePart}${cleanerPart}`)
     }
     parts.push('')
-    parts.push('IMPORTANT: This customer has an active booking. Do NOT try to re-book them or run the booking flow.')
+    parts.push('CRITICAL — The appointment above is the current, correct time. If earlier messages in the conversation mention a different date/time (e.g., the time was corrected after the first proposal), the AUTHORITATIVE time above is right and the earlier mention is stale. Always state the authoritative time in your reply.')
+    parts.push('This customer has an active booking. Do NOT try to re-book them or run the booking flow.')
     parts.push('Instead, help them with questions about their upcoming service (date, time, what to expect, prep instructions).')
     parts.push('If they want to reschedule, cancel, or have a complaint, use [ESCALATE:reason].')
-    parts.push('CRITICAL: When mentioning the booking date, use the EXACT day-of-week shown above. Do NOT guess or calculate the day yourself — use exactly what is listed.')
     parts.push('')
   }
 
@@ -297,20 +405,38 @@ export function formatCustomerContextForPrompt(ctx: CustomerContext, tenant: Ten
     parts.push('')
   }
 
-  // Promotional offer context — use centralized promo-config
-  if (ctx.lead?.form_data) {
+  // ── KNOWN FACTS FROM FORM SUBMISSION (T3 — 2026-04-20) ─────────────
+  // Linda Kingcade submitted the Texas Nova estimate form with bedrooms,
+  // bathrooms, sqft, service, email and estimate. The SMS agent then asked
+  // her for ALL of that again. Customers hate redundant intake. Surface the
+  // form fields as "already known" and tell the agent to only ask for gaps.
+  if (ctx.lead?.form_data && typeof ctx.lead.form_data === 'object') {
     const fd = ctx.lead.form_data as Record<string, unknown>
-    const promoConfig = getPromoConfig(fd)
-    if (promoConfig) {
-      parts.push(...promoConfig.aiContext)
+    const knownLines: string[] = []
+    const pushIf = (label: string, val: unknown) => {
+      if (val !== null && val !== undefined && String(val).trim() !== '') knownLines.push(`${label}: ${val}`)
+    }
+    pushIf('Name', fd.name || [fd.first_name, fd.last_name].filter(Boolean).join(' '))
+    pushIf('Address', fd.address)
+    pushIf('City', fd.city)
+    pushIf('Email', fd.email)
+    pushIf('Bedrooms', fd.bedrooms)
+    pushIf('Bathrooms', fd.bathrooms)
+    pushIf('Half baths', fd.half_baths || fd.halfBathrooms)
+    pushIf('Sqft', fd.sqft || fd.square_footage || fd.squareFootage || fd.sqft_range)
+    pushIf('Service', (fd.service_type as string) || (fd.serviceType as string))
+    pushIf('Frequency', fd.frequency)
+    pushIf('Estimate shown on form', fd.estimated_price ? `$${fd.estimated_price}` : null)
+    pushIf('Preferred date', fd.preferred_date || fd.preferredDate)
+    pushIf('Message/notes', fd.message || fd.notes)
+
+    if (knownLines.length > 0) {
+      parts.push('== KNOWN FACTS FROM FORM SUBMISSION (do NOT re-ask) ==')
+      parts.push(...knownLines)
       parts.push('')
-    } else {
-      // Check for non-promo campaign contexts (book-now, airbnb-turnover)
-      const campaign = fd.utm_campaign as string
-      if (campaign && CAMPAIGN_CONTEXTS[campaign]) {
-        parts.push(...CAMPAIGN_CONTEXTS[campaign])
-        parts.push('')
-      }
+      parts.push('CRITICAL: These fields were already collected via the website form. NEVER re-ask for anything in the list above. Only ask for what is STILL MISSING (e.g., if address is unknown and you need it to book, ask for address — but do NOT ask for bedrooms/bathrooms/email/service type if they are listed above).')
+      parts.push('If the customer restates one of the known facts, acknowledge briefly and move the conversation forward — do not re-collect.')
+      parts.push('')
     }
   }
 
@@ -377,7 +503,7 @@ export async function generateAutoResponse(
     }
   }
 
-  const businessName = tenant?.business_name_short || tenant?.business_name || 'our team'
+  const businessName = tenant?.business_name_short || tenant?.business_name || 'WinBros'
   const sdrName = tenant?.sdr_persona || 'Mary'
   const serviceArea = tenant?.service_area || 'your area'
   // Get the service type from tenant - this differentiates window cleaning from house cleaning etc.
@@ -507,6 +633,7 @@ Rules:
 - Be warm but professional
 - Don't use emojis excessively (1-2 max)
 - NEVER offer discounts, deals, or promotional pricing. You have NO authority to change prices.
+- CRITICAL — BOOKING LANGUAGE: NEVER use phrases like "you're all set", "you're booked", "you're confirmed", "we've got you booked", "scheduled for [day]", "locked in for", "booking confirmed", or "see you [day]" unless the system has already created a confirmed booking. If you are discussing or proposing a time, use proposal language only: "Want me to hold [time] for you?" or "I can lock that in once you confirm" or "Let me pencil you in — I'll confirm once it's locked." The system emits the real confirmation message automatically when a booking is created; you do NOT author confirmations.
 - CRITICAL: Read the conversation history carefully. Respond to what the customer is actually saying.
 - NEVER ask for email. NEVER promise to email anything. The quote link is delivered via SMS. Email sends only happen if the customer explicitly asks ("email me", "send to my email", "prefer email").
 - If they confirmed something (yes/yup/sure), acknowledge and continue the booking flow with the SMS quote link.
@@ -530,7 +657,7 @@ Return ONLY the SMS text, nothing else.`
   }
 
   return {
-    response: smsText,
+    response: sanitizeAIResponse(autoSplitLongMessage(smsText)),
     shouldSend: true,
     reason: 'AI-generated response'
   }
@@ -593,7 +720,7 @@ Write the SMS reply only.`
   }
 
   return {
-    response: smsText,
+    response: sanitizeAIResponse(autoSplitLongMessage(smsText)),
     shouldSend: true,
     reason: 'AI-generated response'
   }
@@ -628,47 +755,6 @@ function detectSilentHandoff(
   ]
 
   return handoffPhrases.some(phrase => lower.includes(phrase))
-}
-
-/**
- * Quote-promise guardrail: detect when the AI promises to send a quote/pricing
- * but doesn't include the [BOOKING_COMPLETE] tag that triggers actual quote creation.
- * If the customer data (bedrooms + bathrooms) is available, append the tag.
- * Otherwise log a warning so we can monitor over-promising.
- *
- * Returns the (possibly modified) response text and whether bookingComplete was forced.
- */
-function applyQuotePromiseGuardrail(
-  responseText: string,
-  hasBookingComplete: boolean,
-  knownCustomerInfo?: KnownCustomerInfo | null,
-): { text: string; forcedBookingComplete: boolean } {
-  if (hasBookingComplete) {
-    return { text: responseText, forcedBookingComplete: false }
-  }
-
-  const quotePromisePattern = /\b(send|sending|get|getting|prepare|preparing|put together|putting together)\s+(you|your)\s+(a\s+)?(quote|pricing|options|estimate|price)/i
-  const promisesQuote = quotePromisePattern.test(responseText)
-
-  if (!promisesQuote) {
-    return { text: responseText, forcedBookingComplete: false }
-  }
-
-  // AI promised a quote — check if we have enough data to deliver
-  const hasBedBath = !!(knownCustomerInfo?.bedrooms && knownCustomerInfo?.bathrooms)
-
-  if (hasBedBath) {
-    // We have the data — append the tag so the webhook creates the actual quote
-    console.log(`[Auto-Response] Quote-promise guardrail: appended [BOOKING_COMPLETE] (had bed/bath data)`)
-    return {
-      text: responseText.trimEnd() + '\n[BOOKING_COMPLETE]',
-      forcedBookingComplete: true,
-    }
-  }
-
-  // AI promised but we can't deliver — log warning for monitoring
-  console.warn(`[Auto-Response] Quote-promise guardrail: AI promised quote without bed/bath data — may have over-promised`)
-  return { text: responseText, forcedBookingComplete: false }
 }
 
 /**
@@ -937,7 +1023,7 @@ async function generateWinBrosResponse(
     const response = await client.messages.create({
       model: 'claude-sonnet-4-5-20250929',
       max_tokens: 500,
-      system: systemPrompt,
+      system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: userMessage }],
     })
 
@@ -950,7 +1036,7 @@ async function generateWinBrosResponse(
 
     const lastCustomerMsg = conversationHistory?.filter(m => m.role === 'client').pop()?.content
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
-    let isBookingComplete = detectBookingComplete(rawText)
+    const isBookingComplete = detectBookingComplete(rawText)
     let isScheduleReady = detectScheduleReady(rawText)
     let cleanResponse = sanitizeAIResponse(autoSplitLongMessage(stripEscalationTags(rawText)))
 
@@ -966,11 +1052,6 @@ async function generateWinBrosResponse(
     // Safety net: if the AI said "reach out" / "get back to you" but didn't include
     // any action tag, treat it as a silent escalation so the owner gets notified.
     const silentHandoff = detectSilentHandoff(rawText, escalation.shouldEscalate, isBookingComplete, isScheduleReady)
-
-    // Quote-promise guardrail: catch "I'll send you a quote" without [BOOKING_COMPLETE]
-    const guardrail = applyQuotePromiseGuardrail(cleanResponse, isBookingComplete, knownCustomerInfo)
-    cleanResponse = guardrail.text
-    if (guardrail.forcedBookingComplete) isBookingComplete = true
 
     // If the AI says it's ready to schedule, call the estimate scheduler
     // and append the available time options to the response
@@ -1047,7 +1128,7 @@ async function generateWinBrosResponse(
 
     const lastCustomerMsg = conversationHistory?.filter(m => m.role === 'client').pop()?.content
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
-    let isBookingComplete = detectBookingComplete(rawText)
+    const isBookingComplete = detectBookingComplete(rawText)
     let isScheduleReady = detectScheduleReady(rawText)
     let cleanResponse = sanitizeAIResponse(autoSplitLongMessage(stripEscalationTags(rawText)))
 
@@ -1059,11 +1140,6 @@ async function generateWinBrosResponse(
     }
 
     const silentHandoff = detectSilentHandoff(rawText, escalation.shouldEscalate, isBookingComplete, isScheduleReady)
-
-    // Quote-promise guardrail: catch "I'll send you a quote" without [BOOKING_COMPLETE]
-    const guardrailOai = applyQuotePromiseGuardrail(cleanResponse, isBookingComplete, knownCustomerInfo)
-    cleanResponse = guardrailOai.text
-    if (guardrailOai.forcedBookingComplete) isBookingComplete = true
 
     // Same scheduling logic for OpenAI fallback
     if (isScheduleReady) {
@@ -1413,7 +1489,7 @@ export async function generateEmailResponse(
     const response = await client.messages.create({
       model: 'claude-sonnet-4-5-20250929',
       max_tokens: 1500,
-      system: systemPrompt,
+      system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: userMessage }],
     })
 
@@ -1426,14 +1502,10 @@ export async function generateEmailResponse(
 
     const lastCustomerMsg = conversationHistory?.filter(m => m.role === 'client').pop()?.content
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
-    let isBookingComplete = detectBookingComplete(rawText)
+    const isBookingComplete = detectBookingComplete(rawText)
     // Email-only: no SMS chunking (||| splits) and no SMS sanitizer (it strips
     // markdown bullets, em-dashes, and any sentence containing "email").
-    let cleanResponse = stripEscalationTags(rawText).trim()
-
-    const guardrail = applyQuotePromiseGuardrail(cleanResponse, isBookingComplete, knownCustomerInfo)
-    cleanResponse = guardrail.text
-    if (guardrail.forcedBookingComplete) isBookingComplete = true
+    const cleanResponse = stripEscalationTags(rawText).trim()
 
     return {
       response: cleanResponse,
@@ -1467,12 +1539,8 @@ export async function generateEmailResponse(
 
     const lastCustomerMsg = conversationHistory?.filter(m => m.role === 'client').pop()?.content
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
-    let isBookingComplete = detectBookingComplete(rawText)
-    let cleanResponse = stripEscalationTags(rawText).trim()
-
-    const guardrailOai = applyQuotePromiseGuardrail(cleanResponse, isBookingComplete, knownCustomerInfo)
-    cleanResponse = guardrailOai.text
-    if (guardrailOai.forcedBookingComplete) isBookingComplete = true
+    const isBookingComplete = detectBookingComplete(rawText)
+    const cleanResponse = stripEscalationTags(rawText).trim()
 
     return {
       response: cleanResponse,
@@ -1509,12 +1577,82 @@ async function generateHouseCleaningResponse(
   customerContext?: CustomerContext | null,
   isRetargetingReply?: boolean,
 ): Promise<AutoResponseResult> {
-  const { buildHouseCleaningSmsSystemPrompt } = await import('./house-cleaning-sms-prompt')
   // Reuse escalation/booking detection from WinBros (same tag format)
   const { detectEscalation, detectBookingComplete, stripEscalationTags } = await import('./winbros-sms-prompt')
 
-  const systemPrompt = await buildHouseCleaningSmsSystemPrompt(tenant)
   const sdrName = tenant.sdr_persona || 'Sarah'
+  const businessName = tenant.business_name_short || tenant.business_name || tenant.name
+  const serviceArea = tenant.service_area || 'your area'
+
+  // ── BUILD 1 #2 + #3: Rapport-first gate + takeover-resume awareness ─────
+  // Extracted to a pure helper for unit testability.
+  // Plan: ~/.claude/plans/a-remeber-i-said-drifting-manatee.md
+  const { shouldDeliverRapportFirst, humanTakeoverRecentlyEnded } = computeRapportGate({
+    knownCustomerInfo,
+    customerContext,
+    isRetargetingReply,
+  })
+
+  // ── INLINE SYSTEM PROMPT (no dynamic import — Turbopack caches stale files) ──
+  const systemPrompt = `You are ${sdrName}, a real person who works at ${businessName}, a professional house cleaning service in ${serviceArea}. You're texting with a potential customer.
+
+You have a CUSTOMER BRAIN section below with everything you know about this person. Use this naturally. Don't announce "I see from our records..." — just reference things like a person who actually remembers.
+
+HARD RULES (these override EVERYTHING):
+- NO emojis. None. Your message will be blocked if you include any.
+- NO em dashes. Use commas or periods.
+- NO markdown. Plain SMS text only.
+- NEVER ask for email, address, name, or square footage. The quote page handles all of that.
+- NEVER offer discounts, deals, or lower prices. You have ZERO price authority. Build value instead.
+- Keep each text 1-2 sentences max. Use ||| to split into multiple texts.
+- Match the customer's energy. If they text short, you text short.
+
+YOUR GOAL:
+Get them a quote and book a cleaning. You're not following a script. Read the room. Use the INDUSTRY INTELLIGENCE, WINNING PATTERNS, and OWNER MESSAGING PATTERNS below to guide your approach. These are real data from conversations that led to bookings.
+
+HOW TO SELL:
+- You genuinely believe this service will improve their life. You're doing them a favor.
+- When they hesitate on price: satisfaction guarantee, Google reviews, background-checked staff, professional supplies. Stack value.
+- "We have a 100% satisfaction guarantee, if anything isn't perfect we come back and fix it free"
+- "Our cleaners are background-checked, insured, and bring all their own supplies"
+- Social proof: "We're highly rated on Google, feel free to check our reviews"
+- Urgency (only when natural): "Our schedule fills up fast, especially weekends"
+- NEVER compare to other companies. NEVER say "competitive".
+- If they mention another company's lower price, acknowledge and pivot to value. Don't bash the competitor.
+
+HOW CONVERSATIONS WORK:
+- If they ask for a price and you have their bed/bath: give the EXACT price from the VERIFIED PRICING section below, then fire [BOOKING_COMPLETE].
+- If they're exploring: build rapport, get bed/bath, acknowledge their needs, then offer "Want me to send you your pricing options?" and fire [BOOKING_COMPLETE].
+- If they're returning: be warm, reference their past experience, make rebooking easy.
+- If they came from a promotion (ACTIVE PROMOTIONAL OFFER below): honor the offer price exactly.
+- If a FRUSTRATION WARNING appears: drop everything and give a direct answer.
+
+WHEN TO FIRE [BOOKING_COMPLETE]:
+- Customer asks for price and you have bed/bath → quote + [BOOKING_COMPLETE]
+- Customer says they want to book → [BOOKING_COMPLETE]
+- You've built rapport and have bed/bath → "Want me to send you your options?" then [BOOKING_COMPLETE]
+- NEVER fire it without bed/bath.
+- NEVER wait more than 2-3 exchanges after getting bed/bath.
+
+The ONLY required data point is bedrooms and bathrooms. Everything else is handled by the quote page.
+
+ABOUT ${businessName.toUpperCase()}:
+- Licensed, bonded, and insured. Background-checked staff.
+- 100% satisfaction guarantee. Not happy? We come back and fix it free.
+- Highly rated on Google. Professional-grade supplies, safe for kids and pets.
+- We clean homes all across ${serviceArea}.
+
+ESCALATION (include tag at END of your response):
+- Special requests beyond standard → [ESCALATE:special_request]
+- Cancel/reschedule/billing → [ESCALATE:service_issue]
+- Customer upset/complaining → [ESCALATE:unhappy_customer]
+- Commercial/Airbnb/post-construction → [ESCALATE:custom_quote]
+When you escalate, say "Our team will reach out shortly!" and STOP.
+
+CRITICAL:
+- NEVER re-ask a question already answered
+- If a human (owner) is already texting, DO NOT jump in
+- If someone is looking for work as a cleaner, say "Shoot me a text at ${tenant.owner_phone || 'the owner directly'} and we can chat about opportunities"`
 
   const historyContext = conversationHistory?.length
     ? conversationHistory.slice(-50).map(m => `${m.role === 'client' ? 'Customer' : sdrName}: ${m.content}`).join('\n')
@@ -1608,12 +1746,28 @@ async function generateHouseCleaningResponse(
     const hasBedBath = !!(knownCustomerInfo.bedrooms && knownCustomerInfo.bathrooms)
     const hasAddress = !!knownCustomerInfo.address
     let bookingReadyHint = ''
-    if (hasBedBath && hasAddress) {
-      bookingReadyHint = '\nIMPORTANT: You already have address + bedrooms + bathrooms. Trigger [BOOKING_COMPLETE] RIGHT NOW in your response. Do not ask any more questions first.'
+    if (hasBedBath && hasAddress && shouldDeliverRapportFirst) {
+      // Build 1 #2: rapport-first gate intercepts the [BOOKING_COMPLETE] trigger.
+      // Send ONE human-feeling rapport / value-build turn instead. No price, no tag.
+      bookingReadyHint = '\nCRITICAL — RAPPORT-FIRST GATE: You have all booking facts (bed/bath/address). However, this customer has NEVER received our pre-quote rapport / value-build message. You MUST send that message NOW before the system can deliver the quote link. Rules for THIS turn only:\n'
+        + '  - Send ONE short, human-feeling message (under 160 chars, splits with ||| if needed).\n'
+        + '  - Briefly acknowledge what they want.\n'
+        + '  - Ask ONE casual rapport question that invites a reply (examples: "real quick before I send your quote, anything specific you want us to focus on?", "any pets we should know about?", "how is your day going?").\n'
+        + '  - Mention ONE value point: insured + background-checked staff, all supplies included, 100% satisfaction guarantee, or highly rated on Google.\n'
+        + '  - DO NOT mention any price, dollar amount, or quote URL.\n'
+        + '  - DO NOT fire [BOOKING_COMPLETE] in this turn. The system fires the quote link on the NEXT inbound from them.\n'
+        + '  - Do NOT promise to "send the quote now", say "send your quote next" or similar future tense.\n'
+    } else if (hasBedBath && hasAddress) {
+      bookingReadyHint = '\nIMPORTANT: You already have address + bedrooms + bathrooms. Trigger [BOOKING_COMPLETE] RIGHT NOW in your response. Do not ask any more questions first. NEVER include any dollar amount, price number, or currency symbol in the SMS body, the quote link reveals price.'
     } else if (hasBedBath) {
-      bookingReadyHint = '\nIMPORTANT: You already have bedrooms and bathrooms on file. The ONLY thing you need is the address. As soon as the customer provides an address (in this message or a previous one), trigger [BOOKING_COMPLETE] immediately. Do not ask additional questions.'
+      bookingReadyHint = '\nIMPORTANT: You already have bedrooms and bathrooms on file. The ONLY thing you need is the address. As soon as the customer provides an address (in this message or a previous one), trigger [BOOKING_COMPLETE] immediately. Do not ask additional questions. NEVER include any dollar amount in the SMS body.'
     } else if (hasAddress) {
-      bookingReadyHint = '\nIMPORTANT: You already have the address on file. The ONLY thing you need is bedrooms and bathrooms. As soon as the customer provides bed/bath count, trigger [BOOKING_COMPLETE] immediately. Do not ask additional questions.'
+      bookingReadyHint = '\nIMPORTANT: You already have the address on file. The ONLY thing you need is bedrooms and bathrooms. As soon as the customer provides bed/bath count, trigger [BOOKING_COMPLETE] immediately. Do not ask additional questions. NEVER include any dollar amount in the SMS body.'
+    }
+
+    // Build 1 #3: takeover-resume awareness, prepended to the booking hint.
+    if (humanTakeoverRecentlyEnded) {
+      bookingReadyHint = '\nHUMAN-OPERATOR-WAS-HANDLING-THIS-THREAD: A human operator was managing this conversation until very recently. Read the FULL conversation history below carefully. Do NOT repeat anything the human already said. If the human already addressed the customer\'s last question, briefly acknowledge and move forward. Be especially careful not to undo or contradict anything the human told the customer. When in doubt, defer to what the human said.\n' + bookingReadyHint
     }
 
     if (parts.length > 0) {
@@ -1757,64 +1911,14 @@ async function generateHouseCleaningResponse(
     if (pricingStd || pricingDeep || pricingMove) {
       const currency = tenant.workflow_config && (tenant.workflow_config as Record<string, unknown>).currency === 'CAD' ? 'CAD' : 'USD'
       const sym = currency === 'CAD' ? 'CA$' : '$'
-
-      // PROMO OVERRIDE: if customer arrived via an active promo (e.g. $149 Meta ad),
-      // the promo price IS the first-clean price. Without this override the AI sees
-      // two contradictory blocks (verified deep $625 vs promo $149) and quotes the
-      // wrong one — then hallucinates "offer expired" when challenged.
-      // Incident: Mary Osias, 2026-04-17.
-      const promoForPricing = customerContext?.lead?.form_data
-        ? getPromoConfig(customerContext.lead.form_data as Record<string, unknown>)
-        : null
-
-      if (promoForPricing) {
-        verifiedPricingBlock = `\n\nVERIFIED PRICING FOR THIS CUSTOMER (${knownCustomerInfo?.bedrooms} bed / ${knownCustomerInfo?.bathrooms} bath) — all prices in ${currency}:\n`
-        verifiedPricingBlock += `- FIRST CLEAN (active ${sym}${promoForPricing.price} promo): ${sym}${promoForPricing.price} — ${promoForPricing.hours}h with ${promoForPricing.cleaners} cleaner(s). THIS IS THE PRICE TO QUOTE.\n`
-        if (pricingStd) verifiedPricingBlock += `- Recurring standard clean (visit 2+): ${sym}${pricingStd.price}\n`
-        if (pricingDeep) verifiedPricingBlock += `- Recurring deep clean (visit 2+): ${sym}${pricingDeep.price}\n`
-        if (pricingMove) verifiedPricingBlock += `- Move in/out: ${sym}${pricingMove.price}\n`
-        verifiedPricingBlock += `RULES:\n`
-        verifiedPricingBlock += `- For the FIRST clean, quote ${sym}${promoForPricing.price} ONLY. Do NOT quote the recurring rate as if it were the first-clean price.\n`
-        verifiedPricingBlock += `- The ${sym}${promoForPricing.price} promo is ACTIVE. NEVER tell the customer it is "expired" or "no longer available" — they just clicked the live ad.\n`
-        verifiedPricingBlock += `- Recurring rates are only relevant if the customer explicitly asks about visits 2+. Don't lead with them.\n`
-      } else {
-        verifiedPricingBlock = `\n\nVERIFIED PRICING FOR THIS CUSTOMER (${knownCustomerInfo?.bedrooms} bed / ${knownCustomerInfo?.bathrooms} bath) — all prices in ${currency}:\n`
-        if (pricingStd) verifiedPricingBlock += `- Standard clean: ${sym}${pricingStd.price}\n`
-        if (pricingDeep) verifiedPricingBlock += `- Deep clean: ${sym}${pricingDeep.price}\n`
-        if (pricingMove) verifiedPricingBlock += `- Move in/out: ${sym}${pricingMove.price}\n`
-        verifiedPricingBlock += 'Use ONLY these prices. Do NOT guess or interpolate.\n'
-      }
+      verifiedPricingBlock = `\n\nVERIFIED PRICING FOR THIS CUSTOMER (${knownCustomerInfo?.bedrooms} bed / ${knownCustomerInfo?.bathrooms} bath) — all prices in ${currency}:\n`
+      if (pricingStd) verifiedPricingBlock += `- Standard clean: ${sym}${pricingStd.price}\n`
+      if (pricingDeep) verifiedPricingBlock += `- Deep clean: ${sym}${pricingDeep.price}\n`
+      if (pricingMove) verifiedPricingBlock += `- Move in/out: ${sym}${pricingMove.price}\n`
+      verifiedPricingBlock += 'Use ONLY these prices. Do NOT guess or interpolate.\n'
     }
   } catch (megaBrainErr) {
     console.error('[HC AI] Mega brain context failed (non-blocking):', megaBrainErr)
-  }
-
-  // 2b. Owner messaging patterns — learned from human-sent messages (highest authority)
-  let ownerPatternsBlock = ''
-  try {
-    const { getSupabaseServiceClient: getSvc } = await import('./supabase')
-    const svc = getSvc()
-
-    // Get human patterns for the current conversation stage
-    const { data: ownerPatterns } = await svc
-      .from('conversation_intelligence')
-      .select('action_type, conv_stage, message_content, timing_gap_seconds, led_to_booking, patterns')
-      .eq('tenant_id', tenant.id)
-      .eq('is_human', true)
-      .eq('led_to_booking', true)
-      .not('message_content', 'is', null)
-      .order('created_at', { ascending: false })
-      .limit(5)
-
-    if (ownerPatterns?.length) {
-      ownerPatternsBlock = '\n\nOWNER MESSAGING PATTERNS (how the business owner texts — highest authority, mimic this style):\n'
-      ownerPatternsBlock += 'These are REAL messages from the owner that led to bookings. Match this tone and approach:\n'
-      for (const p of ownerPatterns) {
-        ownerPatternsBlock += `- [${p.action_type} at ${p.conv_stage}] "${p.message_content}"\n`
-      }
-    }
-  } catch {
-    // Non-blocking — owner patterns not yet available (cold start)
   }
 
   // ── PROMPT ASSEMBLY ORDER ──
@@ -1826,11 +1930,10 @@ async function generateHouseCleaningResponse(
   // 6. Customer context (active jobs, history, notes)
   // 7. Customer brain (DB profile, spend, preferences)
   // 8. Memory (remembered facts from past conversations)
-  // 9. Owner patterns (learned from human-sent messages — highest authority)
-  // 10. Industry intelligence (Osiris Brain knowledge chunks)
-  // 11. AI learning (conversation stage + frustration + winning patterns)
-  // 12. The customer's actual message
-  const userMessage = `Today's date: ${today}\n\nConversation so far:\n${historyContext}${knownInfoBlock}${verifiedPricingBlock}${returningCustomerBlock}${contextBlock}${customerBrainBlock}${memoryBlock}${ownerPatternsBlock}${brainBlock}${aiLearningBlock}${patternsBlock}\n\nCustomer just texted: "${message}"\n\nRespond as ${sdrName}. Write ONLY the SMS text (and escalation/booking-complete tag if needed). Nothing else.\n\nFORMATTING: NO emojis (blocked if included). NO em dashes. NO markdown. Plain short texts. Use ||| to split. Match the customer's texting style.`
+  // 9. Industry intelligence (Osiris Brain knowledge chunks)
+  // 10. AI learning (conversation stage + frustration + winning patterns)
+  // 11. The customer's actual message
+  const userMessage = `Today's date: ${today}\n\nConversation so far:\n${historyContext}${knownInfoBlock}${verifiedPricingBlock}${returningCustomerBlock}${contextBlock}${customerBrainBlock}${memoryBlock}${brainBlock}${aiLearningBlock}${patternsBlock}\n\nCustomer just texted: "${message}"\n\nRespond as ${sdrName}. Write ONLY the SMS text (and escalation/booking-complete tag if needed). Nothing else.\n\nFORMATTING: NO emojis (blocked if included). NO em dashes. NO markdown. Plain short texts. Use ||| to split. Match the customer's texting style.`
 
   const anthropicKey = process.env.ANTHROPIC_API_KEY
   if (anthropicKey) {
@@ -1840,7 +1943,7 @@ async function generateHouseCleaningResponse(
     const response = await client.messages.create({
       model: 'claude-sonnet-4-5-20250929',
       max_tokens: 500,
-      system: systemPrompt,
+      system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
       messages: [{ role: 'user', content: userMessage }],
     })
 
@@ -1855,21 +1958,38 @@ async function generateHouseCleaningResponse(
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
     let isBookingComplete = detectBookingComplete(rawText)
     let cleanResponse = sanitizeAIResponse(autoSplitLongMessage(stripEscalationTags(rawText)))
-    const silentHandoff = detectSilentHandoff(rawText, escalation.shouldEscalate, isBookingComplete, false)
 
-    // Quote-promise guardrail: catch "I'll send you a quote" without [BOOKING_COMPLETE]
-    const guardrail = applyQuotePromiseGuardrail(cleanResponse, isBookingComplete, knownCustomerInfo)
-    cleanResponse = guardrail.text
-    if (guardrail.forcedBookingComplete) isBookingComplete = true
+    // Build 1 #2: rapport-first override. If we instructed rapport-only and the
+    // model still tagged [BOOKING_COMPLETE], strip the tag and treat as rapport.
+    let isRapportTurn = false
+    if (shouldDeliverRapportFirst) {
+      isBookingComplete = false
+      isRapportTurn = true
+      cleanResponse = cleanResponse.replace(/\[BOOKING_COMPLETE\]/gi, '').trim()
+    }
+
+    // Build 1 #1: defense-in-depth currency strip when a quote-send is imminent.
+    // Whether shouldDeliverRapportFirst (no price ever) OR booking-complete (link
+    // delivers price), the SMS body must NOT contain a dollar amount.
+    if (isRapportTurn || isBookingComplete) {
+      const { stripped, didStrip } = stripCurrencyForQuoteSend(cleanResponse)
+      if (didStrip) {
+        console.warn('[HC AI] Currency token leaked into SMS body — stripped. Raw:', rawText.slice(0, 200))
+      }
+      cleanResponse = stripped
+    }
+
+    const silentHandoff = detectSilentHandoff(rawText, escalation.shouldEscalate, isBookingComplete, false)
 
     return {
       response: cleanResponse,
       shouldSend: true,
-      reason: 'House cleaning AI-generated response',
+      reason: isRapportTurn ? 'House cleaning rapport-first turn' : 'House cleaning AI-generated response',
       escalation: silentHandoff
         ? { shouldEscalate: true, reasons: ['silent_handoff_no_tag'] }
         : escalation.shouldEscalate ? escalation : undefined,
       bookingComplete: isBookingComplete || undefined,
+      rapportSent: isRapportTurn || undefined,
     }
   }
 
@@ -1898,21 +2018,35 @@ async function generateHouseCleaningResponse(
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
     let isBookingComplete = detectBookingComplete(rawText)
     let cleanResponse = sanitizeAIResponse(autoSplitLongMessage(stripEscalationTags(rawText)))
-    const silentHandoff = detectSilentHandoff(rawText, escalation.shouldEscalate, isBookingComplete, false)
 
-    // Quote-promise guardrail: catch "I'll send you a quote" without [BOOKING_COMPLETE]
-    const guardrailOai = applyQuotePromiseGuardrail(cleanResponse, isBookingComplete, knownCustomerInfo)
-    cleanResponse = guardrailOai.text
-    if (guardrailOai.forcedBookingComplete) isBookingComplete = true
+    // Build 1 #2: rapport-first override (mirror Claude path).
+    let isRapportTurn = false
+    if (shouldDeliverRapportFirst) {
+      isBookingComplete = false
+      isRapportTurn = true
+      cleanResponse = cleanResponse.replace(/\[BOOKING_COMPLETE\]/gi, '').trim()
+    }
+
+    // Build 1 #1: currency strip when a quote-send is imminent.
+    if (isRapportTurn || isBookingComplete) {
+      const { stripped, didStrip } = stripCurrencyForQuoteSend(cleanResponse)
+      if (didStrip) {
+        console.warn('[HC AI/OpenAI] Currency token leaked into SMS body — stripped. Raw:', rawText.slice(0, 200))
+      }
+      cleanResponse = stripped
+    }
+
+    const silentHandoff = detectSilentHandoff(rawText, escalation.shouldEscalate, isBookingComplete, false)
 
     return {
       response: cleanResponse,
       shouldSend: true,
-      reason: 'House cleaning AI-generated response (OpenAI)',
+      reason: isRapportTurn ? 'House cleaning rapport-first turn (OpenAI)' : 'House cleaning AI-generated response (OpenAI)',
       escalation: silentHandoff
         ? { shouldEscalate: true, reasons: ['silent_handoff_no_tag'] }
         : escalation.shouldEscalate ? escalation : undefined,
       bookingComplete: isBookingComplete || undefined,
+      rapportSent: isRapportTurn || undefined,
     }
   }
 
@@ -1926,3 +2060,4 @@ async function generateHouseCleaningResponse(
     reason: 'House cleaning template fallback',
   }
 }
+// Cache bust: Thu, Apr 16, 2026  3:51:29 PM

@@ -1270,14 +1270,6 @@ export async function createCleanerAssignment(
     return null
   }
 
-  // Delete any cancelled/declined assignment for this job+cleaner to avoid unique constraint
-  await client
-    .from('cleaner_assignments')
-    .delete()
-    .eq('job_id', jobId)
-    .eq('cleaner_id', cleanerId)
-    .in('status', ['cancelled', 'declined'])
-
   const { data, error } = await client
     .from('cleaner_assignments')
     .insert({

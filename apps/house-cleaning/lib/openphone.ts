@@ -75,12 +75,109 @@ export async function sendSMS(
     source?: string
     /** Optional customer ID for the pre-inserted record */
     customerId?: string | number | null
+    /**
+     * Classifier for quiet-hours gating (T6 — 2026-04-20):
+     *   - 'transactional' (default when missing): reply to an inbound customer
+     *     message or any time-critical confirmation. Always sends.
+     *   - 'outreach': proactive cron/agent-initiated send. Gated on the
+     *     tenant's 9am–9pm quiet-hours window. Outside the window, the message
+     *     is enqueued into sms_outreach_queue for /api/cron/drain-sms-queue.
+     *   - 'internal': cleaner dispatch or owner alerts. Always sends.
+     */
+    kind?: 'transactional' | 'outreach' | 'internal'
   }
 ): Promise<SendSMSResponse> {
 
   if (!tenant) {
     console.error('No tenant found - cannot send SMS')
     return { success: false, error: 'No tenant configured' }
+  }
+
+  // ── Defense-in-depth: split on `|||` chunk separator ─────────────
+  // Our AI prompts return multi-part SMS joined by `|||`. Most call sites
+  // split before calling sendSMS, but at least one path leaked the literal
+  // `|||` into a customer's text (Conner T., 2026-04-26 16:30: "...meet
+  // them outside.|||See you then!"). Doing it here too means the leak
+  // CANNOT recur regardless of which caller forgets.
+  if (message.includes('|||')) {
+    const parts = message.split('|||').map(p => p.trim()).filter(Boolean)
+    if (parts.length > 1) {
+      let lastResp: SendSMSResponse = { success: false, error: 'no parts sent' }
+      for (let i = 0; i < parts.length; i++) {
+        // Recurse without the separator. Pre-insert source applied to the
+        // first part only — subsequent parts share the same conversation.
+        const partOpts = i === 0 ? options : { ...options, source: undefined, skipDedup: true }
+        lastResp = await sendSMS(tenant, to, parts[i], partOpts)
+        if (!lastResp.success) return lastResp
+        // Tiny pacing delay so OpenPhone preserves message order.
+        if (i < parts.length - 1) await new Promise(r => setTimeout(r, 600))
+      }
+      return lastResp
+    }
+    // Only one non-empty part after split — fall through and send normally
+    // with the trimmed content (drops a trailing/leading `|||`).
+    message = parts[0] || message.replace(/\|\|\|/g, ' ').trim()
+  }
+
+  // ── Defense-in-depth: refuse to ship garbage first-name/template injections ─
+  // Catches messages like "Hey aza_98@ymail.com, no pressure..." or
+  // "Hey 32 Apartment Rooms, ..." where a polluted customers.first_name was
+  // pasted into a `Hey {name},` template (cold_followup blast 2026-04-21/22).
+  // Heuristic: only checks the literal `Hey <token>,` pattern at the start so
+  // we don't over-block legitimate addresses, prices, etc. mid-sentence.
+  const heyMatch = /^\s*Hey\s+([^,!?\n]{1,80})[,!?]/i.exec(message)
+  if (heyMatch) {
+    const greetTarget = heyMatch[1].trim()
+    const looksLikeJunk =
+      /[@$#]/.test(greetTarget) ||
+      /\d/.test(greetTarget) ||
+      greetTarget.split(/\s+/).length > 2 ||
+      /^(no|yes|maybe|none|n\/a|hi|hello|address|old\s+lady|old\s+man|not\s+sure|idk|test|null|undefined)$/i.test(greetTarget)
+    if (looksLikeJunk) {
+      console.error(
+        `[${tenant.slug}] BLOCKED garbage greeting — "Hey ${greetTarget}," looks like a polluted first_name. ` +
+        `Source: ${options?.source || 'unknown'} customerId=${options?.customerId || 'none'}`
+      )
+      return { success: false, error: `Blocked garbage greeting: "Hey ${greetTarget},"` }
+    }
+  }
+
+  // ── T6 Quiet-hours gate ───────────────────────────────────────────
+  // Only applies to kind='outreach'. Transactional replies and internal
+  // (cleaner-facing) sends always go immediately.
+  if (options?.kind === 'outreach') {
+    try {
+      const { isWithinQuietHoursWindow, nextAllowedSendAt, resolveTimezone } = await import('./timezone-from-area-code')
+      const tz = resolveTimezone({ tenantTimezone: tenant.timezone, phone: to })
+      if (!isWithinQuietHoursWindow(tz)) {
+        const scheduledFor = nextAllowedSendAt(tz)
+        const queueClient = getSupabaseServiceClient()
+        const { data: queued, error: queueErr } = await queueClient
+          .from('sms_outreach_queue')
+          .insert({
+            tenant_id: tenant.id,
+            customer_id: options.customerId ? Number(options.customerId) || null : null,
+            phone: to,
+            body: message,
+            source: options.source || 'unknown',
+            scheduled_for_at: scheduledFor.toISOString(),
+            status: 'pending',
+            metadata: { reason: 'quiet_hours', timezone: tz },
+          })
+          .select('id')
+          .single()
+        if (queueErr) {
+          console.error(`[${tenant.slug}] Quiet-hours queue insert failed — skipping send:`, queueErr.message)
+          return { success: false, error: `Queue insert failed: ${queueErr.message}` }
+        }
+        console.log(`[${tenant.slug}] SMS queued for ${scheduledFor.toISOString()} (${tz}) — outside 9am–9pm window. queue_id=${queued?.id}`)
+        return { success: true, messageId: `queued:${queued?.id || ''}` }
+      }
+    } catch (err) {
+      // Never let quiet-hours logic block a send when the helper itself errors.
+      // Fall through to the normal send path.
+      console.error(`[${tenant.slug}] Quiet-hours gate failed (non-blocking):`, err)
+    }
   }
 
   // Try tenant config first, then fall back to env var
@@ -94,18 +191,17 @@ export async function sendSMS(
   console.log(`[${tenant.slug}] Using OpenPhone API key from: ${tenant.openphone_api_key ? 'tenant config' : 'env var'}`)
 
   // Use cleaner-specific phone ID when requested (falls back to main if not configured).
-  // NO env-var fallback — missing tenant.openphone_phone_id must fail closed to avoid
-  // cross-tenant send from a shared OPENPHONE_PHONE_ID env.
+  // NOTE: no env-var fallback for the main phone ID — a missing tenant.openphone_phone_id
+  // must fail closed. Falling through to a shared process.env.OPENPHONE_PHONE_ID would
+  // send the message from another tenant's number (cross-tenant brand leak).
   const phoneNumberId = (options?.useCleaner && tenant.openphone_cleaner_phone_id)
     ? tenant.openphone_cleaner_phone_id
     : tenant.openphone_phone_id
 
   if (!phoneNumberId) {
-    console.error(`[${tenant.slug}] OpenPhone phone number ID not configured for tenant — refusing to send`)
+    console.error(`[${tenant.slug}] OpenPhone phone number ID not configured for tenant — refusing to send to avoid cross-tenant send`)
     return { success: false, error: 'OpenPhone phone number ID not configured for tenant' }
   }
-
-  console.log(`[${tenant.slug}] Using OpenPhone phone ID from: ${tenant.openphone_phone_id ? 'tenant config' : 'env var'}`)
 
   const toE164Format = toE164(to)
   if (!toE164Format) {

@@ -202,6 +202,11 @@ export type SystemEventType =
   // Customer dedup (AJ incident 2026-04-17)
   | 'CUSTOMER_MERGED_ON_LEAD'
   | 'DUPLICATE_FIRST_NAME_WARNING'
+  | 'META_LEAD_RECEIVED'
+  // Website webhook hardening (2026-04-30)
+  | 'WEBSITE_FORM_PARSE_FAIL'
+  | 'WEBSITE_FORM_LEAD_INSERT_FAIL'
+  | 'WEBSITE_INTRO_DUPE_SUPPRESSED'
   // Outreach v1.0 (frozen 2026-04-22) — Pipelines A/B/C + audit + state machine
   | 'OUTREACH_GATE_REFUSAL'
   | 'OUTREACH_LINT_FAILED'

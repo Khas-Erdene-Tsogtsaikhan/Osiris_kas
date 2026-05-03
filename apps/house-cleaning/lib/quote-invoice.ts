@@ -133,7 +133,6 @@ export async function generateQuoteInvoice(
       const label = addonDef?.name || (typeof rawAddon !== 'string' ? rawAddon.label : undefined) || key
       const refPrice = addonDef?.price ?? (typeof rawAddon !== 'string' ? rawAddon.price ?? 0 : 0)
       if (included) {
-        // Zero-amount line item — customer sees the value but pays $0 extra.
         if (refPrice > 0) {
           await stripe.invoiceItems.create({
             customer: stripeCustomer.id,
