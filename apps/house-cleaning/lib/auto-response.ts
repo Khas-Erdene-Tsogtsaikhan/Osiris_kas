@@ -1412,7 +1412,7 @@ export async function generateEmailResponse(
 
     const response = await client.messages.create({
       model: 'claude-sonnet-4-5-20250929',
-      max_tokens: 800,
+      max_tokens: 1500,
       system: systemPrompt,
       messages: [{ role: 'user', content: userMessage }],
     })
@@ -1427,9 +1427,10 @@ export async function generateEmailResponse(
     const lastCustomerMsg = conversationHistory?.filter(m => m.role === 'client').pop()?.content
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
     let isBookingComplete = detectBookingComplete(rawText)
-    let cleanResponse = sanitizeAIResponse(autoSplitLongMessage(stripEscalationTags(rawText)))
+    // Email-only: no SMS chunking (||| splits) and no SMS sanitizer (it strips
+    // markdown bullets, em-dashes, and any sentence containing "email").
+    let cleanResponse = stripEscalationTags(rawText).trim()
 
-    // Quote-promise guardrail: catch "I'll send you a quote" without [BOOKING_COMPLETE]
     const guardrail = applyQuotePromiseGuardrail(cleanResponse, isBookingComplete, knownCustomerInfo)
     cleanResponse = guardrail.text
     if (guardrail.forcedBookingComplete) isBookingComplete = true
@@ -1451,7 +1452,7 @@ export async function generateEmailResponse(
 
     const response = await client.chat.completions.create({
       model: 'gpt-4o-mini',
-      max_tokens: 800,
+      max_tokens: 1500,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
@@ -1467,9 +1468,8 @@ export async function generateEmailResponse(
     const lastCustomerMsg = conversationHistory?.filter(m => m.role === 'client').pop()?.content
     const escalation = detectEscalation(rawText, conversationHistory, lastCustomerMsg)
     let isBookingComplete = detectBookingComplete(rawText)
-    let cleanResponse = sanitizeAIResponse(autoSplitLongMessage(stripEscalationTags(rawText)))
+    let cleanResponse = stripEscalationTags(rawText).trim()
 
-    // Quote-promise guardrail: catch "I'll send you a quote" without [BOOKING_COMPLETE]
     const guardrailOai = applyQuotePromiseGuardrail(cleanResponse, isBookingComplete, knownCustomerInfo)
     cleanResponse = guardrailOai.text
     if (guardrailOai.forcedBookingComplete) isBookingComplete = true
